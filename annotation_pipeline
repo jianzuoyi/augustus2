@@ -1,0 +1,566 @@
+#! /usr/bin/env python
+
+#########################################################################
+# File Name: annotation_pipeline.py
+# Author: Tang Hao
+# mail: tanghao@genebang.com
+# Created Time: Tue 04 Jul 2017 11:49:33 AM CST
+#########################################################################
+
+import argparse, os, os.path
+Bin = os.path.split(os.path.realpath(__file__))[0]
+
+def build_hisatdb(genome):
+	script = '''job_begin
+	name build_hisatdb
+	sched_options -V -cwd -l vf=30G
+	cmd_begin
+		mkdir -p {path}/01.illumina_RNAseq/00.build_db;
+		cd {path}/01.illumina_RNAseq/00.build_db &&
+		/opt/bio/hisat2-2.0.4/hisat2-build {G} {path}/01.illumina_RNAseq/00.build_db/genome -p 8
+	cmd_end
+job_end
+'''.format(G = genome, path = os.getcwd())
+	return script
+
+def build_formatdb(genome):
+	script = '''
+job_begin
+	name build_formatdb
+	sched_options -V -cwd -l vf=2G
+	cmd_begin
+		mkdir -p {path}/02.homolog/00.formatdb;
+		cd {path}/02.homolog/00.formatdb &&
+		ln -sf {G} &&
+		/opt/bio/ncbi-blast-2.6.0+-src/c++/bin/makeblastdb -dbtype nucl -parse_seqids -in {path}/02.homolog/00.formatdb/{g}
+	cmd_end
+job_end
+'''.format(G = genome, path = os.getcwd(), g = os.path.basename(genome))
+	return script
+
+def homolog(genome, pep, n, species):
+	global Bin
+	script = '''
+job_begin
+	name homolog_{species}
+	host localhost
+	cmd_begin
+		mkdir -p {path}/02.homolog/0{n}.{species};
+		cd {path}/02.homolog/0{n}.{species} &&
+		perl {bin}/homolog/protein_map_genome.pl --step 1234 --cpu 100 --align_rate 0.01 --extend_len 500 --tophit 3 --blast_eval 1e-5 --line 1000 {pep} {path}/02.homolog/00.formatdb/{g}
+	cmd_end
+job_end
+
+order homolog_{species} after build_formatdb
+'''.format(g = os.path.basename(genome), path = os.getcwd(), pep = pep, n = str(n), species = species, bin = Bin)
+	return script
+
+def eachomolog(genome, out, list):
+	with open(list) as list:
+		n = 1
+		for line in list:
+			line = line.strip()
+			if line:
+				pep = line.split()[1]
+				species = line.split()[0]
+				out.write(homolog(genome, pep, n, species))
+				n += 1
+
+def soapnuke(list):
+	global Bin
+	script = '''
+job_begin
+	name soapnuke_run
+	host localhost
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python {bin}/SOAPnuke.py {l} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=5G --maxjob 100 --lines 1 {path}/01.illumina_RNAseq/shell/all_SOAPnukescript.sh
+	cmd_end
+job_end
+
+order soapnuke_run after build_hisatdb
+'''.format(l = list, path = os.getcwd(), bin = Bin)
+	return script
+
+def hisat(list):
+	global Bin
+	script = '''
+job_begin
+	name hisat_run
+	host localhost
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python {bin}/hisat.py {l} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=10G --maxjob 1 --lines 1 {path}/01.illumina_RNAseq/shell/all_hisatscript.sh
+	cmd_end
+job_end 
+
+order hisat_run after soapnuke_run
+'''.format(l = list, path = os.getcwd(), bin = Bin)
+	return script
+
+def stringtie(list):
+	global Bin
+	script = '''
+job_begin
+	name stringtie_run
+	host localhost
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python {bin}/stringtie.py {l} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=25G --maxjob 1 --lines 1 {path}/01.illumina_RNAseq/shell/all_stringtiescript.sh
+	cmd_end
+job_end
+
+order stringtie_run after hisat_run
+'''.format(l = list, path = os.getcwd(), bin = Bin)
+	return script
+
+def Trinity_run(lst):
+	l = []
+	r = []
+	with open(lst, 'r') as lines:
+		for e in lines:
+			e = e.strip()
+			if e:
+				read1 = e.split(',')[0]				
+				read2 = e.split(',')[1]
+				file = '_'.join(os.path.basename(read1).split('_')[:-1])
+				l.append('{path}/01.illumina_RNAseq/01.cleandata/{f}/{f}_clean_1.fq.gz'.format(path = os.getcwd(), f = file))
+				r.append('{path}/01.illumina_RNAseq/01.cleandata/{f}/{f}_clean_2.fq.gz'.format(path = os.getcwd(), f = file))
+		left = ','.join(l)
+		rigth = ','.join(r)
+	script = '''
+job_begin
+	name trinity_run
+	sched_options -V -cwd -l vf=180g
+	cmd_begin
+		mkdir -p {path}/01.illumina_RNAseq/04.Trinity;
+		/its1/GB_BT2/tanghao/software/trinityrnaseq-Trinity-v2.4.0/Trinity 
+			--group_pairs_distance 300 
+			--path_reinforcement_distance 65 
+			--min_glue 3 
+			--min_kmer_cov 3 
+			--min_contig_length 100 
+			--seqType fq 
+			--left {lr} 
+			--right {rr} 
+			--max_memory 150G 
+			--CPU 28 
+			--inchworm_cpu 12 
+			--KMER_SIZE 25 
+			--bflyHeapSpaceInit 1G 
+			--bflyHeapSpaceMax 4G 
+			--bfly_opts "-V 5 --edge-thr=0.1 --stderr" 
+			--output {path}/01.illumina_RNAseq/04.Trinity
+	cmd_end
+job_end
+
+order trinity_run after soapnuke_run
+'''.format(lr = left, rr = rigth, path = os.getcwd())
+	return script
+
+def stringtie_merge(list):
+	global Bin
+	script = '''
+job_begin
+	name stringtie_merge
+	sched_options -V -cwd -l vf=2G
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python {bin}/stringtie_list.py {l} &&
+		/opt/bio/stringtie-1.2.4.Linux_x86_64/stringtie --merge  -o {path}/01.illumina_RNAseq/03.stringtie/stringtie_merged.gtf {path}/01.illumina_RNAseq/03.stringtie/stringtie.lst
+	cmd_end
+job_end
+
+order stringtie_merge after stringtie_run
+'''.format(l = list, path = os.getcwd(), bin = Bin)
+	return script
+
+def convertbam_ccs(fofn):
+	global Bin
+	script = '''
+job_begin
+	name convert_ccs
+	host localhost
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/00.shell {path}/03.Isoseq/01.bax2bam {path}/03.Isoseq/02.CCS;
+		cd {path}/03.Isoseq/00.shell &&
+		ln -sf {absfofn} &&
+		python {bin}/convertbam_ccs.py {fofn} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=30G --maxjob 100 --lines 1 {path}/03.Isoseq/00.shell/all.sh
+	cmd_end
+job_end
+'''.format(path = os.getcwd(), fofn = os.path.basename(fofn), absfofn = os.path.abspath(fofn), bin = Bin)
+	return script
+
+def deal_fofn(fofn):
+	lst = []
+	with open(fofn, 'r') as lines:
+		for line in lines:
+			path = line.strip()
+			sample = '_'.join(os.path.basename(path).split('_')[:-1])
+			lst.append(sample)
+		sampleset = set(lst)
+	return sampleset
+
+def classify(sampleset):
+	script = '''
+job_begin
+	name classify
+	sched_options -V -cwd -l vf=60G
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/03.classify;
+		cd {path}/03.Isoseq/03.classify &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink5/smrtcmds/bin/dataset create --type ConsensusReadSet all.ccs.xml {all_ccs} &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink5/smrtcmds/bin/dataset create --type SubreadSet all.subreads.xml {all_subreads} &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink5/smrtcmds/bin/pbtranscript classify --flnc isoseq_flnc.fasta --nfl isoseq_nfl.fasta -d classify_out --cpus 24 --min_seq_len 200 all.ccs.xml isoseq_draft.fasta
+	cmd_end
+job_end
+
+order classify after convert_ccs
+'''.format(all_ccs = ' '.join(['{path}/03.Isoseq/02.CCS/'.format(path = os.getcwd()) + i + '.ccs.bam' for i in sampleset]), all_subreads = ' '.join(['{path}/03.Isoseq/01.bax2bam/'.format(path = os.getcwd()) + i + '.subreads.bam' for i in sampleset]), path = os.getcwd())
+	return script
+
+def cluster_polish():
+	script = '''
+job_begin
+	name cluster_polish
+	host localhost
+	cmd_begin
+		mkdir {path}/03.Isoseq/04.cluster_polish;
+		cd {path}/03.Isoseq/04.cluster_polish &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink5/smrtcmds/bin/pbtranscript cluster --nfl_fa {path}/03.Isoseq/03.classify/isoseq_nfl.fasta --bas_fofn {path}/03.Isoseq/03.classify/all.subreads.xml --quiver --use_sge --blasr_nproc 4 --quiver_nproc 2 --gcon_nproc 2 --max_sge_jobs 200 {path}/03.Isoseq/03.classify/isoseq_flnc.fasta unpolish_Consensus.fasta 
+	cmd_end
+job_end
+
+order cluster_polish after classify
+'''.format(path = os.getcwd())
+	return script
+
+def GMAP_build(genome):
+	script = '''
+job_begin
+	name gmap_build
+	sched_options -V -cwd -l vf=30G
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/00.build_gmapdb &&
+		cd {path}/03.Isoseq/05.GMAP/00.build_gmapdb;
+		/its1/GB_BT2/tanghao/software/gmap-2017-05-08/bin/gmap_build -d Genome {G} -D {path}/03.Isoseq/05.GMAP/00.build_gmapdb
+	cmd_end
+job_end
+'''.format(path = os.getcwd(), G = genome)
+	return script
+
+def GMAP():
+	script = '''
+job_begin
+	name gmap
+	sched_options -V -cwd -l vf=80G
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/01.gmap;
+		cd {path}/03.Isoseq/05.GMAP/01.gmap &&
+		/its1/GB_BT2/tanghao/software/gmap-2017-05-08/bin/gmap -D {path}/03.Isoseq/05.GMAP/00.build_gmapdb -d Genome -z sense_force -f samse -n 0 -t 4 {path}/03.Isoseq/04.cluster_polish/cluster_out/all_quivered_hq.100_30_0.99.fasta > hq_quivered.sam 2> hq_quivered.sam.log
+	cmd_end
+job_end
+
+order gmap after gmap_build
+order gmap after cluster_polish
+'''.format(path = os.getcwd())
+	return script
+
+def collapse():
+	script = '''
+job_begin
+	name collapse_isoforms
+	sched_options -V -cwd -l vf=10G
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/02.collapse_isoforms;
+		cd {path}/03.Isoseq/05.GMAP/02.collapse_isoforms &&
+		sort -k 3,3 -k 4,4n {path}/03.Isoseq/05.GMAP/01.gmap/hq_quivered.sam | grep @ -v > hq_quivered.sort.sam &&
+		/opt/bio/cDNA_Cupcake-master/build/scripts-2.7/collapse_isoforms_by_sam.py --input {path}/03.Isoseq/04.cluster_polish/cluster_out/all_quivered_hq.100_30_0.99.fasta -s hq_quivered.sort.sam -o hq_quivered
+	cmd_end
+job_end
+
+order collapse_isoforms after gmap
+'''.format(path = os.getcwd())
+	return script
+
+def transdecoder(genome):
+	global Bin
+	script = '''
+job_begin
+	name transdecoder
+	sched_options -V -cwd -l vf=10G
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/06.Transdecoder;
+		cd {path}/03.Isoseq/06.Transdecoder &&
+		/its1/GB_BT2/tanghao/software/TransDecoder-4.0.1/util/cufflinks_gtf_to_alignment_gff3.pl {path}/03.Isoseq/05.GMAP/02.collapse_isoforms/hq_quivered.collapsed.gff > transcripts.gff3 &&
+		/its1/GB_BT2/tanghao/software/TransDecoder-4.0.1/util/cufflinks_gtf_genome_to_cdna_fasta.pl {path}/03.Isoseq/05.GMAP/02.collapse_isoforms/hq_quivered.collapsed.gff {G} > transcripts.fasta &&
+		/its1/GB_BT2/tanghao/software/TransDecoder-4.0.1/TransDecoder.LongOrfs -t transcripts.fasta &&
+		/its1/GB_BT2/tanghao/software/TransDecoder-4.0.1/TransDecoder.Predict -t transcripts.fasta &&
+		/its1/GB_BT2/tanghao/software/TransDecoder-4.0.1/util/cdna_alignment_orf_to_genome_orf.pl transcripts.fasta.transdecoder.gff3 transcripts.gff3 transcripts.fasta 2> transcripts.fasta.transdecoder.genome.gff3.log > transcripts.fasta.transdecoder.genome.gff3 &&
+		{bin}/longest_stranscript.py transcripts.fasta.transdecoder.genome.gff3
+	cmd_end
+job_end
+
+order transdecoder after collapse_isoforms
+'''.format(G = genome, path = os.getcwd(), bin = Bin)
+	return script
+
+def augustus_train(genome):
+	global Bin
+	script = '''
+job_begin
+	name augustus_train
+	sched_options -V -cwd -l vf=10G
+	cmd_begin
+		mkdir -p {path}/04.abinitio/01.Training;
+		cd {path}/04.abinitio/01.Training &&
+		python {bin}/random_extract.py {path}/03.Isoseq/06.Transdecoder/longest_transcript.gff &&
+		perl /opt/bio/augustus-3.2.3/scripts/autoAugTrain.pl --genome {G} --trainingset trainning.gff --species target_species -v -v -v --useexisting  >auto_training.log 2>&1
+	cmd_end
+job_end
+
+order augustus_train after transdecoder 
+'''.format(G = genome, path = os.getcwd(), bin = Bin)
+	return script
+
+def augustus_run(maskgenome):
+	global Bin
+	script = '''
+job_begin
+	name augustus_run
+	host localhost	
+	cmd_begin
+		mkdir -p {path}/04.abinitio/02.RunAug;
+		cd {path}/04.abinitio/02.RunAug &&
+		perl {bin}/augustus/Run_Augustus.pl --maxjob 30 --species target_species --prog /opt/bio/augustus-3.2.3/bin/augustus --run T {MG}
+	cmd_end
+job_end
+
+order augustus_run after augustus_train
+'''.format(path = os.getcwd(), MG = maskgenome, bin = Bin)
+	return script
+
+def augustus_perfect(genome, maskgenome):
+	global Bin
+	maskg_gff = os.path.basename(maskgenome) + '.augustus.gff'
+	script = '''
+job_begin
+	name augustus_perfect
+	sched_options -V -cwd -l vf=1G
+	cmd_begin
+		mkdir -p {path}/04.abinitio/03.Perfect;
+		cd {path}/04.abinitio/03.Perfect &&
+		{bin}/augustus/perfect.sh {path}/04.abinitio/02.RunAug/{MG} {G}
+	cmd_end
+job_end
+
+order augustus_perfect after augustus_run
+'''.format(path = os.getcwd(), G = genome, MG = maskg_gff, bin = Bin)
+	return script
+
+def EVM(maskgenome, genome):
+	global Bin
+	maskg_gff = os.path.basename(maskgenome) + '.augustus.gff.new.check.gff'
+	script = '''
+job_begin
+	name EVM_run
+	sched_options -V -cwd -l vf=2G
+	cmd_begin
+		mkdir -p {path}/05.EVM {path}/05.EVM/tmp;
+		cd {path}/05.EVM &&
+		cat {path}/02.homolog/*/*solar.genewise.gff > genewise_all.gff &&
+		python {bin}/EVM/augustus_convert_gff3.py {path}/04.abinitio/03.Perfect/{MG} &&
+		cat {path}/03.Isoseq/06.Transdecoder/transcripts.fasta.transdecoder.genome.gff3 AUGUSTUS.gff3 > Abinitio.gff3 &&
+		python {bin}/EVM/genewise_convert_gff3.py genewise_all.gff &&
+		python {bin}/EVM/stringtie_convert_gff3.py {path}/01.illumina_RNAseq/03.stringtie/stringtie_merged.gtf &&
+		cd {path}/05.EVM/tmp &&
+		{bin}/EVM/run_evm.sh {G} Abinitio.gff3 homolog.gff3 transcripts.gff3
+	cmd_end
+job_end
+
+order EVM_run after augustus_perfect
+order EVM_run after stringtie_merge 
+'''.format(path = os.getcwd(), MG = maskg_gff, G = genome, bin = Bin)
+	return script
+
+def order_homolog(peplist, out):
+	with open(peplist) as lines:
+		for line in lines:
+			line = line.strip()
+			if line:
+				species = line.split()[0]
+				out.write('order EVM_run after homolog_{S}'.format(S = species) + '\n')
+
+def PASA(genome, cutf = 20):
+	global Bin
+	script = '''
+job_begin
+	name PASA_update
+	sched_options -V -cwd -l vf=20G
+	cmd_begin
+		mkdir -p {path}/06.PASA;
+		cd {path}/06.PASA &&
+		sh {bin}/Pasa_update.sh {G} {path}/05.EVM/EVM.all.gff3 {path}/01.illumina_RNAseq/04.Trinity/Trinity.fasta &&
+		python {bin}/extraction_sort.py Pasa_update.out &&
+		split_fasta.pl --cutf {c}  --prefix Pasa_update --outdir cut --fasta pasa_update.pep
+	cmd_end
+job_end
+
+order PASA_update after trinity_run
+order PASA_update after EVM_run
+'''.format(path = os.getcwd(), G = genome, bin = Bin, c = cutf)
+	return script
+
+def blast_solar(types, cutf = 20):
+	global Bin
+	if types == 'nr':
+		db = '/its1/pub/annotdb/nr/201605/nr'
+	elif types == 'uniport':
+		db = '/its1/pub/annotdb/uniprot/release-2017_07/plant.fa'
+	script = '''
+job_begin
+	name {type}_blast_solar
+	sched_options -V -cwd -l vf=40G
+	cmd_begin
+		mkdir -p {path}/07.Filter/01.blast;
+		cd {path}/07.Filter/01.blast &&
+		python {bin}/cut_blast.py {type} {cutf} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=5G --maxjob 100 --lines 1 {path}/07.Filter/01.blast/{type}_blastall_all.sh &&
+		cat {path}/07.Filter/01.blast/split_{type}/*blast > {type}.blast &&
+		perl {bin}/homolog/solar/solar.pl -a prot2prot -z -f m8 {type}.blast > {type}.blast.solar
+	cmd_end
+job_end
+
+order {type}_blast_solar after PASA_update
+'''.format(path = os.getcwd(), db = db, type = types, bin = Bin, cutf = cutf)
+	return script
+	
+def filter_nr_uni():
+	global Bin
+	blast_nr_script = blast_solar('nr')
+	blast_uni_script = blast_solar('uniport')
+	script = '''{blast_nr}{blast_uni}
+job_begin
+	name merge_nr_uni
+	sched_options -V -cwd -l vf=1G 
+	cmd_begin
+		cd {path}/07.Filter/01.blast &&
+		python {bin}/filter_hits.py {path}/06.PASA/pasa_update.pep nr.blast uniprot.blast nr.blast.solar uniprot.blast.solar 
+	cmd_end
+job_end
+
+order merge_nr_uni after nr_blast_solar
+order merge_nr_uni after uniport_blast_solar
+'''.format(path = os.getcwd(), blast_nr = blast_nr_script, blast_uni = blast_uni_script, bin = Bin)
+	return script
+
+def Pfam():
+	global Bin
+	script = '''
+job_begin
+	name Pfam_hits
+	sched_options -V -cwd -l vf=20G
+	cmd_begin
+		mkdir -p {path}/07.Filter/02.Pfam;
+		cd /07.Filter/02.Pfam &&
+		python {bin}/extraction_pep.py {path}/07.Filter/01.blast/without_hits_ID_gl50.out {path}/06.PASA/pasa_update.pep without_nr_uni.pep &&
+		export PATH=/its1/GB_BT2/tanghao/software/hmmer-3.1b2-linux-intel-x86_64/binaries/:$PATH &&
+		export PERL5LIB=/its1/GB_BT2/tanghao/software/PfamScan/:$PERL5LIB &&
+		perl /its1/GB_BT2/tanghao/software/PfamScan/pfam_scan.pl -fasta without_nr_uni.pep -dir /its1/GB_BT2/tanghao/software/PfamScan/Pfam_databases -outfile fam_hmmer.out -cpu 4 -as &&
+		python {bin}/extraction_Pfam.py Pfam_hmmer.out
+	cmd_end
+job_end
+
+order Pfam_hits after merge_nr_uni
+'''.format(path = os.getcwd(), bin = Bin)
+	return script
+
+def mcscanx():
+	global Bin
+	script = '''
+job_begin
+	name MCScanx
+	sched_options -V -cwd -l vf=30G
+	cmd_begin
+		mkdir -p {path}/08.MCScanX;
+		cd {path}/08.MCScanX &&
+		cat {path}/07.Filter/01.blast/with_hits_ID.out {path}/07.Filter/02.Pfam/Pfam_hit_ID > hits_all.ids &&
+		python {bin}/extraction_with_hits.py hits_all.ids {path}/06.PASA/Pasa_update.gff3 {path}/06.PASA/pasa_update.pep &&
+		/opt/bio/ncbi-blast-2.6.0+-src/c++/bin/makeblastdb -in final_hits.pep -dbtype prot -title pepdb -parse_seqids -out pepdb -logfile pepdb.log &&
+		python {bin}/mcscan_gff.py final_hits.gff3 &&
+		/opt/bio/ncbi-blast-2.6.0+-src/c++/bin/blastp -query final_hits.pep -db pepdb -out Mcscanx.blast -outfmt 6 -evalue 1e-10 -num_alignments 5 -num_threads 4 &&
+		/its1/GB_BT2/tanghao/software/MCScanX/MCScanX {path}/08.MCScanX/Mcscanx &&
+		python {bin}/tandem.py Mcscanx.tandem &&
+		python {bin}/longest_tandem.py tandem_gene final_hits.gff3 final_hits.pep	
+	cmd_end
+job_end
+
+order MCScanx after Pfam_hits
+'''.format(path = os.getcwd(), bin = Bin)
+	return script
+
+def Parser_args():
+	description = '''
+		This is a pipeline of genome annotation with Isoseq data~!
+'''
+	epilog = '''
+	After you execute this program, you will obtain a "annotation.job" file, run it as:
+		'/opt/bio/SJM/bin/sjm annotation.job'
+ _____________________________________________________________
+< The author is tanghao, and his mail is tanghao@genebang.com >
+ -------------------------------------------------------------
+		                \   ^__^
+        		         \  (oo)\_______
+                		    (__)\       )\/\\
+                        		||----w |
+		WWWW   WwWw     WwW     ||     ||  WwWW
+'''
+	parser = argparse.ArgumentParser(formatter_class = argparse.RawDescriptionHelpFormatter, description = description, epilog = epilog)
+	pginput = parser.add_argument_group('required arguments')
+	pginput.add_argument('--genome', required = True, help = 'genome sequence; fasta format')
+	pginput.add_argument('--RNAseqlist', required = True, help = 'fastq file list for RNAseq, the read1 and read2 are separated by commas without spaces and in the same line')
+	pginput.add_argument('--peplist', required = True, help = 'the protein file list of homolog, the name of species and the absolute path are separated by space in the same line')
+	pginput.add_argument('--fofn', required = True, help = 'the absolute path of bax file of Isoseq')
+	pginput.add_argument('--maskG', required = True, help = 'the repmask genome sequence')
+
+	args = parser.parse_args()
+	return args
+
+def main():
+	args = Parser_args()
+	if not os.path.exists('{path}/log'.format(path = os.getcwd())):
+		os.system('mkdir log')
+	with open('annotation.job', 'w') as out:
+		out.write(build_hisatdb(args.genome))
+		out.write(soapnuke(args.RNAseqlist))
+		out.write(hisat(args.RNAseqlist))
+		out.write(stringtie(args.RNAseqlist))
+		out.write(stringtie_merge(args.RNAseqlist))
+		out.write(Trinity_run(args.RNAseqlist))
+		out.write(build_formatdb(args.genome))
+		eachomolog(args.genome, out, args.peplist)
+		out.write(convertbam_ccs(args.fofn))
+		out.write(GMAP_build(args.genome))
+		sample = deal_fofn(args.fofn)
+		out.write(classify(sample))
+		out.write(cluster_polish())
+		out.write(GMAP())
+		out.write(collapse())
+		out.write(transdecoder(args.genome))
+		out.write(augustus_train(args.genome))
+		out.write(augustus_run(args.maskG))
+		out.write(augustus_perfect(args.genome, args.maskG))
+		out.write(EVM(args.maskG, args.genome))
+		order_homolog(args.peplist, out)
+		out.write(PASA(args.genome))		
+		out.write(filter_nr_uni())
+		out.write(Pfam())
+		out.write(mcscanx())
+		out.write('\n'+'log_dir {path}/log'.format(path = os.getcwd()))
+
+if __name__ == '__main__':
+    main()
